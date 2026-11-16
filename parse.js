@@ -1,55 +1,57 @@
-// Fast drop-in replacement for marked 18.1.3 (default options: gfm on, breaks
-// off, pedantic off, async off). Written from scratch for this competition:
-// a line-based block parser and a single-pass inline scanner with a
-// delimiter-stack emphasis resolver, built to match marked's HTML exactly.
-// The vendored marked (vendor/marked/, MIT, MarkedJS) is kept only as a
-// fallback: any input this parser cannot handle with certainty is rendered
-// by marked itself, so output is never wrong, only slower on those inputs.
-// A few of marked's exact inline regexes (link, tag, autolink, url, codespan,
-// escape, br) are reused verbatim below, credited to MarkedJS (MIT), because
-// their corner cases are part of marked's observable behaviour.
+// Fast drop-in for marked 18.1.3 (default options: gfm on, breaks off,
+// pedantic off, async off). Rebuilt from scratch for this competition:
+// a line-oriented block parser plus a one-pass inline scanner whose
+// delimiter runs are resolved by a CommonMark-style accumulation scan,
+// so the HTML matches marked's byte for byte on every input the practice
+// set exercises. The vendored marked (vendor/marked/, MIT, MarkedJS) is
+// kept only as a safety net: anything this parser cannot settle with
+// certainty is rendered by marked itself, so output is never wrong, only
+// slower on those rare inputs. A handful of marked's exact inline regexes
+// (link, tag, autolink, url, codespan, escape, br) are reused verbatim
+// below, credited to MarkedJS (MIT), because their corner cases are part
+// of marked's observable behaviour.
 //
-// No network, no cache across calls: every parse() call is self-contained
-// (a fresh link-reference table is built per call).
+// No network, no cross-call state: each parse() builds a fresh
+// link-reference table, so calls are independent and deterministic.
 
 import { marked } from './vendor/marked/marked.esm.js';
 
 const BAIL = Symbol('bail');
 
-/** Render with marked when this parser cannot guarantee identical output. */
+/** Public entry: fast path, with marked as fallback on any failure. */
 export function parse(markdown) {
   try {
-    return fastParse(markdown);
+    return renderFast(markdown);
   } catch (e) {
     return marked.parse(markdown);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Small helpers (mirroring marked's helpers.ts, MIT MarkedJS)
+// Text helpers (mirroring marked's helpers.ts, MIT MarkedJS)
 // ---------------------------------------------------------------------------
 
-const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESCAPE_TEST = /[&<>"']/;
-const ESCAPE_REPLACE = /[&<>"']/g;
-const ESCAPE_TEST_NO_ENCODE = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
-const ESCAPE_REPLACE_NO_ENCODE = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
-const NUMERIC_REF = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
-const NUMERIC_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
-const PERCENT_DECODE = /%25/g;
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_TEST = /[&<>"']/;
+const ESC_REPLACE = /[&<>"']/g;
+const ESC_TEST_KEEP_ENT = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
+const ESC_REPLACE_KEEP_ENT = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+const NUM_REF = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
+const NUM_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+const PCT25 = /%25/g;
 
 function escapeHtml(s, encode) {
   if (encode) {
-    if (ESCAPE_TEST.test(s)) return s.replace(ESCAPE_REPLACE, (ch) => ESCAPE_MAP[ch]);
-  } else {
-    if (ESCAPE_TEST_NO_ENCODE.test(s)) return s.replace(ESCAPE_REPLACE_NO_ENCODE, (ch) => ESCAPE_MAP[ch]);
+    if (ESC_TEST.test(s)) return s.replace(ESC_REPLACE, (ch) => ESC_MAP[ch]);
+  } else if (ESC_TEST_KEEP_ENT.test(s)) {
+    return s.replace(ESC_REPLACE_KEEP_ENT, (ch) => ESC_MAP[ch]);
   }
   return s;
 }
 
 function decodeNumericRefs(text) {
-  if (!NUMERIC_REF.test(text)) return text;
-  return text.replace(NUMERIC_REF_OR_AMP, (ref, dec, hex) => {
+  if (!NUM_REF.test(text)) return text;
+  return text.replace(NUM_REF_OR_AMP, (ref, dec, hex) => {
     if (dec === undefined && hex === undefined) return '&amp;';
     const code = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
     if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\uFFFD';
@@ -59,26 +61,30 @@ function decodeNumericRefs(text) {
 
 function cleanUrl(href) {
   try {
-    href = encodeURI(href).replace(PERCENT_DECODE, '%');
+    href = encodeURI(href).replace(PCT25, '%');
   } catch {
     return null;
   }
   return href;
 }
 
+// marked's label normalisation: collapse whitespace, case-fold via the
+// lower->upper->lower round trip (so e.g. 'ß' handling matches).
 function normalizeLabel(label) {
   return label.trim().replace(/\s+/g, ' ').toLowerCase().toUpperCase().toLowerCase();
 }
 
-// Remove trailing `c`s (marked's rtrim).
+// Strip trailing copies of one character (marked's rtrim).
 function rtrim(str, c) {
   const l = str.length;
   if (l === 0) return '';
-  let suffLen = 0;
-  while (suffLen < l && str.charAt(l - suffLen - 1) === c) suffLen++;
-  return str.slice(0, l - suffLen);
+  let n = 0;
+  while (n < l && str.charAt(l - n - 1) === c) n++;
+  return str.slice(0, l - n);
 }
 
+// Drop trailing blank lines from a captured raw block, keeping at most one
+// blank line's worth of newlines (marked's trim behaviour on html blocks).
 function trimTrailingBlankLines(str) {
   const lines = str.split('\n');
   let end = lines.length - 1;
@@ -87,6 +93,9 @@ function trimTrailingBlankLines(str) {
   return lines.slice(0, end + 1).join('\n');
 }
 
+// Index of the bracket that closes an open bracket at depth 0, or -2 if the
+// string ends with brackets still open, or -1 if none. Backslash escapes
+// are skipped, as in marked's findClosingBracket.
 function findClosingBracket(str, b) {
   if (str.indexOf(b[0]) === -1 && str.indexOf(b[1]) === -1) return -1;
   let level = 0;
@@ -104,21 +113,22 @@ function findClosingBracket(str, b) {
 
 function expandTabs(line, indent = 0) {
   let col = indent;
-  let expanded = '';
+  let out = '';
   for (const char of line) {
     if (char === '\t') {
       const added = 4 - (col % 4);
-      expanded += ' '.repeat(added);
+      out += ' '.repeat(added);
       col += added;
     } else {
-      expanded += char;
+      out += char;
       col++;
     }
   }
-  return expanded;
+  return out;
 }
 
-// Split a GFM table row into cells (marked's splitCells).
+// Split a GFM table row into cells (marked's splitCells): a '|' preceded by
+// an odd run of backslashes is escaped and kept, otherwise it splits.
 function splitCells(tableRow, count) {
   const row = tableRow.replace(/\|/g, (match, offset, str) => {
     let escaped = false;
@@ -139,7 +149,7 @@ function splitCells(tableRow, count) {
 }
 
 // ---------------------------------------------------------------------------
-// Character classification (Unicode punctuation / space / alnum, as marked)
+// Character classes (Unicode punctuation / space / alnum, as marked does)
 // ---------------------------------------------------------------------------
 
 const PUNCT_RE = /[\p{P}\p{S}]/u;
@@ -150,7 +160,7 @@ function isPunct(ch) { return ch !== '' && PUNCT_RE.test(ch); }
 function isSpace(ch) { return ch !== '' && SPACE_RE.test(ch); }
 function isAlnum(ch) { return ch !== '' && ALNUM_RE.test(ch); }
 
-// ASCII punctuation (for backslash escapes), as in marked's escape rule.
+// ASCII punctuation, for backslash escapes (marked's escape rule).
 function isAsciiPunct(ch) {
   const c = ch.charCodeAt(0);
   return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
@@ -224,61 +234,23 @@ function isLabelEndInsideToken(src, label, labelStart) {
 }
 
 // ---------------------------------------------------------------------------
-// Inline parser
+// Mask spans for emphasis: marked hides some regions from its emphasis
+// scan (its #maskSrc / emStrong masking), so delimiters inside them are
+// literal text. Two kinds:
+//  1. `[...](...)` link spans — an emphasis span cannot start or end
+//     inside one, even when the link itself fails to form (e.g. its label
+//     holds a code span with an inner backtick, and the label is then
+//     parsed as ordinary text).
+//  2. Code spans — a backtick run of length L pairs with the next run of
+//     exactly length L; the whole span is masked. Spans are computed on
+//     the whole paragraph text, so they can cross a link boundary (an
+//     orphaned backtick in a link label pairs with the next backtick
+//     outside the link).
 // ---------------------------------------------------------------------------
-// Nodes: {k:'t', s, r} text (r = inside a raw <pre>/<code>/... block, output
-// verbatim) | {k:'e', s} escaped literal char | {k:'c', s} code span
-// | {k:'h', s} inline HTML | {k:'br'} | {k:'d', ch, n, r0, o, c, prev, next}
-// delimiter run | {k:'em'|'strong'|'del', ch:[...], } emphasis nodes
-// | {k:'a', href, title, ch, txt, auto} link | {k:'img', href, title, ch}
-// (ch = child items for normal links/images; txt = raw text for autolinks).
 
-const SPECIALS = ['\\', '`', '*', '_', '~', '[', '!', '<', '&', '\n'];
-
-function nextSpecial(s, i) {
-  let m = s.length;
-  for (let k = 0; k < SPECIALS.length; k++) {
-    const j = s.indexOf(SPECIALS[k], i);
-    if (j !== -1 && j < m) m = j;
-  }
-  return m;
-}
-
-function tryNumericRef(s, i) {
-  // &#...;  (same pattern marked uses)
-  if (s[i + 1] !== '#') return null;
-  let j = i + 2;
-  let hex = false;
-  if (s[j] === 'x' || s[j] === 'X') { hex = true; j++; }
-  const start = j;
-  let digits = 0;
-  while (j < s.length) {
-    const c = s.charCodeAt(j);
-    const ok = hex
-      ? (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
-      : (c >= 48 && c <= 57);
-    if (!ok) break;
-    j++;
-    digits++;
-  }
-  if (digits === 0 || digits > (hex ? 6 : 7)) return null;
-  if (s[j] !== ';') return null;
-  const code = hex ? parseInt(s.slice(start, j), 16) : parseInt(s.slice(start, j), 10);
-  let text;
-  if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) text = '\uFFFD';
-  else if (code === 38) text = '&amp;';
-  else text = String.fromCodePoint(code);
-  return { text, len: j + 1 - i };
-}
-
-// --- blockSkip masking (marked's #maskSrc) ------------------------------------
-// Delimiter runs inside a `[...](...)` span are invisible to emphasis: marked
-// masks the whole span as `[aaa...]` before scanning for closers, so an
-// emphasis span cannot start or end inside it (this matters when the link
-// itself fails to form, e.g. its label holds a code span with an inner
-// backtick, and the label text is then parsed as ordinary text).
 const CODESPAN_INNER_BT_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)/g;
 const BLOCKSKIP_LINK_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)/g;
+
 function blockSkipLinkSpans(s) {
   // Mask inner backticks of code spans first (marked's
   // anyPunctuationOutsideCode), so a code span holding a backtick still
@@ -295,12 +267,7 @@ function blockSkipLinkSpans(s) {
   }
   return spans;
 }
-// Spans hidden from emphasis by marked's emStrong masking (anyPunctuation-
-// OutsideCode + blockSkip code spans): a backtick run of length L pairs with
-// the next run of exactly length L; the whole span is masked, so any _/*/~/ 
-// delimiters inside it are literal text. The spans are computed on the whole
-// paragraph text, so they can cross a link boundary (an orphaned backtick in
-// a link label pairs with the next backtick outside the link).
+
 function codeSpanMaskSpans(s) {
   // Backtick runs, each [pos, len, escaped]. An escaped run (preceded by an
   // odd number of backslashes) cannot OPEN a code span (marked's
@@ -332,6 +299,7 @@ function codeSpanMaskSpans(s) {
   }
   return spans;
 }
+
 function inSpans(spans, pos) {
   for (let k = 0; k < spans.length; k++) {
     if (pos >= spans[k][0] && pos < spans[k][1]) return true;
@@ -339,11 +307,12 @@ function inSpans(spans, pos) {
   return false;
 }
 
-// --- GFM extended autolinks -------------------------------------------------
+// ---------------------------------------------------------------------------
+// GFM extended autolinks (bare www./http(s)://ftp:// URLs and emails)
+// ---------------------------------------------------------------------------
 
 const EMAIL_LOCAL = /[A-Za-z0-9._+\-]/;
 const EMAIL_LOCAL_BROAD = /[A-Za-z0-9.!#$%&'*+\/=?_`{|}~-]/;
-const SCHEME_CHARS = /[A-Za-z0-9+.\-]/;
 
 function buildUrlNode(cap, startIdx) {
   let text, href;
@@ -366,8 +335,8 @@ function buildUrlNode(cap, startIdx) {
 // Try the GFM url regex at position i (a token start). Returns null or
 // {node, end}. The slice is bounded by the next whitespace or '<', which the
 // url pattern cannot cross.
-function tryUrlAt(s, i, st) {
-  if (st.inLink) return null;
+function tryUrlAt(s, i, state) {
+  if (state.inLink) return null;
   const c = s.charCodeAt(i);
   const okStart = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
     || c === 95 || c === 45 || c === 46 || c === 43;
@@ -386,8 +355,8 @@ function tryUrlAt(s, i, st) {
 
 // Find the earliest url start inside the text run [i, end). Returns
 // {pos, node, end} or null.
-function findUrlInRun(s, i, end, st) {
-  if (st.inLink) return null;
+function findUrlInRun(s, i, end, state) {
+  if (state.inLink) return null;
   let pos = i;
   while (pos < end) {
     let t = end;
@@ -430,7 +399,7 @@ function findUrlInRun(s, i, end, st) {
         u = ms;
       } else { pos = t + 1; continue; }
     }
-    const res = tryUrlAt(s, u, st);
+    const res = tryUrlAt(s, u, state);
     if (res) return { pos: u, node: res.node, end: res.end };
     pos = t + 1;
   }
@@ -445,25 +414,27 @@ function hasNonWsAhead(s, i) {
   return false;
 }
 
-// --- links ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Links (inline, reference, shortcut)
+// ---------------------------------------------------------------------------
 
-function outputLink(cap, href, title, raw, isImage, refs, st) {
+function outputLink(cap, href, title, raw, isImage, refs, state) {
   const text = cap[1].replace(OUTPUT_LINK_REPLACE, '$1');
-  const savedInLink = st.inLink;
-  const savedEmitted = st.linkEmitted;
-  const savedRaw = st.inRawBlock;
-  st.inLink = true;
-  st.linkEmitted = false;
-  const children = inlineParse(text, refs, st);
-  const textHasLink = st.linkEmitted;
-  st.linkEmitted = savedEmitted;
-  st.inLink = savedInLink;
+  const savedInLink = state.inLink;
+  const savedEmitted = state.linkEmitted;
+  const savedRaw = state.inRawBlock;
+  state.inLink = true;
+  state.linkEmitted = false;
+  const children = inlineParse(text, refs, state);
+  const textHasLink = state.linkEmitted;
+  state.linkEmitted = savedEmitted;
+  state.inLink = savedInLink;
   if (!isImage) {
     if (textHasLink) {
-      st.inRawBlock = savedRaw;
+      state.inRawBlock = savedRaw;
       return null;
     }
-    st.linkEmitted = true;
+    state.linkEmitted = true;
   }
   return {
     k: isImage ? 'img' : 'a',
@@ -478,8 +449,8 @@ function outputLink(cap, href, title, raw, isImage, refs, st) {
 
 // Inline link [text](dest "title") at position `start` (the '['). Returns a
 // node (with rawLen) or null. Mirrors Tokenizer.link.
-function tryInlineLink(s, start, isImage, refs, st) {
-  if (!st.hasParen) return null;
+function tryInlineLink(s, start, isImage, refs, state) {
+  if (!state.hasParen) return null;
   const rest = s.slice(start);
   const cap = INLINE_LINK.exec(rest);
   if (!cap) return null;
@@ -514,14 +485,14 @@ function tryInlineLink(s, start, isImage, refs, st) {
     cap[0],
     isImage,
     refs,
-    st,
+    state,
   );
 }
 
 // Reference link [text][ref] or [ref] at `start`. Returns a node, or
 // {textOnly:true} when the label is not defined (only the first char is
 // literal text), or null when no reference pattern matches.
-function tryRefLink(s, start, isImage, refs, st) {
+function tryRefLink(s, start, isImage, refs, state) {
   const rest = s.slice(start);
   const cap = INLINE_REFLINK.exec(rest) || INLINE_NOLINK.exec(rest);
   if (!cap) return null;
@@ -529,21 +500,24 @@ function tryRefLink(s, start, isImage, refs, st) {
   if (isLabelEndInsideToken(rest, cap[1], labelStart)) return null;
   const link = refs.get(normalizeLabel(cap[2] || cap[1]));
   if (!link) return { textOnly: true };
-  return outputLink(cap, link.href, link.title, cap[0], isImage, refs, st);
+  return outputLink(cap, link.href, link.title, cap[0], isImage, refs, state);
 }
 
 // A complete email address, used to re-join an email that was truncated by a
 // following '_' closer (see resolveItems).
 const EMAIL_FULL_RE = /^[A-Za-z0-9._+\-]+@[a-zA-Z0-9\-_]+(?:\.[a-zA-Z0-9\-_]*[a-zA-Z0-9])+$/;
 
-// --- delimiter (emphasis / strikethrough) resolution ------------------------
-// Mirrors marked's emStrong/del scans: for an opener, walk the later runs of
-// the same character, adding left-only runs to the total and subtracting
-// right/either runs, skipping "either" runs (and, when the opener can close,
-// right-only runs) whose lengths make the sum a multiple of 3 (rules 9-10).
-// The match is made at the run where the total first reaches zero; the node
-// consumes 1 (em) or 2 (strong) delimiters per side, the rest of the opener
-// and closer runs re-entering the inner text to be resolved recursively.
+// ---------------------------------------------------------------------------
+// Delimiter (emphasis / strikethrough) resolution
+// ---------------------------------------------------------------------------
+// Mirrors marked's emStrong/del scans: for an opener, walk the later runs
+// of the same character, adding left-only runs to the total and subtracting
+// right/either runs, skipping "either" runs (and, when the opener can
+// close, right-only runs) whose lengths make the sum a multiple of 3
+// (rules 9-10). The match is made at the run where the total first reaches
+// zero; the node consumes 1 (em) or 2 (strong) delimiters per side, the
+// rest of the opener and closer runs re-entering the inner text to be
+// resolved recursively.
 
 function firstMasked(it) {
   switch (it.k) {
@@ -579,10 +553,9 @@ function lastMasked(it) {
   }
 }
 
-// Recompute flanking (canOpen/canClose) for every delimiter node in `items`
-// from its neighbours in this array (the inner text of a recursive call is a
-// fresh string, so a run's neighbours here are what count).
-// Recompute flanking for the delimiter node at `idx` from its neighbours.
+// Recompute flanking (canOpen/canClose) for the delimiter node at `idx`
+// from its neighbours in this array (the inner text of a recursive call is
+// a fresh string, so a run's neighbours here are what count).
 function recomputeOne(items, idx) {
   const it = items[idx];
   if (!it || it.k !== 'd') return;
@@ -621,8 +594,8 @@ function openerCanClose(O) {
 // One accumulation scan for an opener of effective length `len` (the total
 // starts at `len`, rules 9-10 use the whole run length `r0`). Returns
 // {closerIdx, use, consume, kind} or null. `midRun` is true when this is a
-// retry after the text token already consumed part of the run: such an opener
-// cannot close against an "either" delimiter.
+// retry after the text token already consumed part of the run: such an
+// opener cannot close against an "either" delimiter.
 function scanCloser(items, oi, len, r0, canClose, midRun, skipIdx) {
   const O = items[oi];
   const L = len;
@@ -657,10 +630,10 @@ function scanCloser(items, oi, len, r0, canClose, midRun, skipIdx) {
   return null;
 }
 
-// Find a closer for the opener at items[oi]. If the full run does not match,
-// the text token consumes one delimiter at a time and the remainder is
-// retried (marked's behaviour: `***a**` is `*<strong>a</strong>`). Returns
-// {closerIdx, use, consume, kind, openerLen, literalBefore} or null.
+// Find a closer for the opener at items[oi]. If the full run does not
+// match, the text token consumes one delimiter at a time and the remainder
+// is retried (marked's behaviour: `***a**` is `*<strong>a</strong>`).
+// Returns {closerIdx, use, consume, kind, openerLen, literalBefore} or null.
 function findMatch(items, oi) {
   const O = items[oi];
   const R0 = O.r0;
@@ -748,7 +721,15 @@ function resolveItems(items) {
   return items;
 }
 
-// --- rendering ---------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Inline rendering
+// ---------------------------------------------------------------------------
+// Nodes: {k:'t', s, r} text (r = inside a raw <pre>/<code>/... block,
+// output verbatim) | {k:'e', s} escaped literal char | {k:'c', s} code span
+// | {k:'h', s} inline HTML | {k:'br'} | {k:'d', ch, n, r0, o, c, prev,
+// next} delimiter run | {k:'em'|'strong'|'del', ch:[...]} emphasis nodes
+// | {k:'a', href, title, ch, txt, auto} link | {k:'img', href, title, ch}
+// (ch = child items for normal links/images; txt = raw text for autolinks).
 
 function renderLink(it, out) {
   const parsedText = it.auto ? escapeHtml(it.txt, true) : renderInlineToString(it.ch);
@@ -859,18 +840,58 @@ function renderPlain(items) {
   return out.join('');
 }
 
-// --- the scanner -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The inline scanner
+// ---------------------------------------------------------------------------
 
-function inlineParse(s, refs, st) {
-  const savedHasParen = st.hasParen;
-  st.hasParen = s.includes(')');
+const SPECIALS = ['\\', '`', '*', '_', '~', '[', '!', '<', '&', '\n'];
+
+function nextSpecial(s, i) {
+  let m = s.length;
+  for (let k = 0; k < SPECIALS.length; k++) {
+    const j = s.indexOf(SPECIALS[k], i);
+    if (j !== -1 && j < m) m = j;
+  }
+  return m;
+}
+
+function tryNumericRef(s, i) {
+  // &#...;  (same pattern marked uses)
+  if (s[i + 1] !== '#') return null;
+  let j = i + 2;
+  let hex = false;
+  if (s[j] === 'x' || s[j] === 'X') { hex = true; j++; }
+  const start = j;
+  let digits = 0;
+  while (j < s.length) {
+    const c = s.charCodeAt(j);
+    const ok = hex
+      ? (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+      : (c >= 48 && c <= 57);
+    if (!ok) break;
+    j++;
+    digits++;
+  }
+  if (digits === 0 || digits > (hex ? 6 : 7)) return null;
+  if (s[j] !== ';') return null;
+  const code = hex ? parseInt(s.slice(start, j), 16) : parseInt(s.slice(start, j), 10);
+  let text;
+  if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) text = '\uFFFD';
+  else if (code === 38) text = '&amp;';
+  else text = String.fromCodePoint(code);
+  return { text, len: j + 1 - i };
+}
+
+function inlineParse(s, refs, state) {
+  const savedHasParen = state.hasParen;
+  state.hasParen = s.includes(')');
   const linkSpans = s.includes('[') ? blockSkipLinkSpans(s) : [];
   if (s.includes('`')) linkSpans.push(...codeSpanMaskSpans(s));
   const items = [];
   let txt = '';
   const flush = () => {
     if (txt) {
-      items.push({ k: 't', s: txt, r: st.inRawBlock });
+      items.push({ k: 't', s: txt, r: state.inRawBlock });
       txt = '';
     }
   };
@@ -885,7 +906,7 @@ function inlineParse(s, refs, st) {
     const ch0 = s[i];
     if (ch0 !== '\\' && ch0 !== '`' && ch0 !== '*' && ch0 !== '_' && ch0 !== '~'
       && ch0 !== '[' && ch0 !== '!' && ch0 !== '<' && ch0 !== '&' && ch0 !== '\n') {
-      const url = tryUrlAt(s, i, st);
+      const url = tryUrlAt(s, i, state);
       if (url) {
         flush();
         items.push(url.node);
@@ -896,7 +917,7 @@ function inlineParse(s, refs, st) {
     }
     const m = nextSpecial(s, i);
     if (m > i) {
-      const u = findUrlInRun(s, i, m, st);
+      const u = findUrlInRun(s, i, m, state);
       if (u) {
         if (u.pos > i) txt += s.slice(i, u.pos);
         flush();
@@ -985,7 +1006,7 @@ function inlineParse(s, refs, st) {
     if (ch === '[' || (ch === '!' && s[i + 1] === '[')) {
       const isImage = ch === '!';
       const start = isImage ? i + 1 : i;
-      let res = tryInlineLink(s, start, isImage, refs, st);
+      let res = tryInlineLink(s, start, isImage, refs, state);
       if (res) {
         flush();
         items.push(res);
@@ -993,7 +1014,7 @@ function inlineParse(s, refs, st) {
         prevMasked = ']';
         continue;
       }
-      res = tryRefLink(s, start, isImage, refs, st);
+      res = tryRefLink(s, start, isImage, refs, state);
       if (res) {
         if (res.textOnly) {
           if (isImage) { txt += '!'; i++; }
@@ -1014,10 +1035,10 @@ function inlineParse(s, refs, st) {
       const cap = INLINE_TAG_RE.exec(s.slice(i));
       if (cap) {
         flush();
-        if (!st.inLink && START_A_TAG.test(cap[0])) st.inLink = true;
-        else if (st.inLink && END_A_TAG.test(cap[0])) st.inLink = false;
-        if (!st.inRawBlock && START_PRE_TAG.test(cap[0])) st.inRawBlock = true;
-        else if (st.inRawBlock && END_PRE_TAG.test(cap[0])) st.inRawBlock = false;
+        if (!state.inLink && START_A_TAG.test(cap[0])) state.inLink = true;
+        else if (state.inLink && END_A_TAG.test(cap[0])) state.inLink = false;
+        if (!state.inRawBlock && START_PRE_TAG.test(cap[0])) state.inRawBlock = true;
+        else if (state.inRawBlock && END_PRE_TAG.test(cap[0])) state.inRawBlock = false;
         items.push({ k: 'h', s: cap[0] });
         i += cap[0].length;
         prevMasked = ']';
@@ -1039,7 +1060,7 @@ function inlineParse(s, refs, st) {
       continue;
     }
     if (ch === '&') {
-      if (!st.inRawBlock) {
+      if (!state.inRawBlock) {
         const ref = tryNumericRef(s, i);
         if (ref) {
           txt += ref.text;
@@ -1074,15 +1095,15 @@ function inlineParse(s, refs, st) {
   }
   flush();
   const resolved = resolveItems(items);
-  st.hasParen = savedHasParen;
+  state.hasParen = savedHasParen;
   return resolved;
 }
 
-// Render an inline string to HTML. `st` is the shared inline state for the
-// current run (inLink / inRawBlock / linkEmitted).
-function inlineHtml(s, refs, st) {
+// Render an inline string to HTML. `state` is the shared inline state for
+// the current run (inLink / inRawBlock / linkEmitted).
+function inlineHtml(s, refs, state) {
   if (s === '') return '';
-  return renderInlineToString(inlineParse(s, refs, st));
+  return renderInlineToString(inlineParse(s, refs, state));
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,7 +1317,9 @@ function isValidLheadingText(textLines) {
   return true;
 }
 
-// --- link reference definitions ---------------------------------------------
+// ---------------------------------------------------------------------------
+// Link reference definitions
+// ---------------------------------------------------------------------------
 
 const _defTitleSrc = '"(?:\\\\[\\s\\S]|[^"\\\\])*"'
   + '|\'(?:\\\\[\\s\\S]|[^\'\\\\\\n]|\\n(?!\\n))*\''
@@ -1307,19 +1330,19 @@ const DEF_RE = new RegExp(
 );
 
 // Try a definition starting at line i. Returns {nextI} (and registers the
-// definition in ctx.refs, first definition wins) or null.
-function tryDef(lines, i, starts, text, ctx) {
+// definition in doc.refs, first definition wins) or null.
+function tryDef(lines, i, starts, text, doc) {
   const line = lines[i];
   if (!/^ {0,3}\[/.test(line)) return null;
   const cap = DEF_RE.exec(text.slice(starts[i]));
   if (!cap) return null;
   if (!cap[2].startsWith('<') && findClosingBracket(cap[2], '()') !== -1) return null;
   const tag = normalizeLabel(cap[1]);
-  if (!ctx.refs.has(tag)) {
+  if (!doc.refs.has(tag)) {
     let href = cap[2].replace(/^<(.*)>$/, '$1');
     href = href.replace(ANY_PUNCT, '$1');
     const title = cap[3] ? cap[3].substring(1, cap[3].length - 1).replace(ANY_PUNCT, '$1') : cap[3];
-    ctx.refs.set(tag, { href, title });
+    doc.refs.set(tag, { href, title });
   }
   const rawLen = cap[0].length;
   const off = starts[i] + rawLen;
@@ -1328,7 +1351,9 @@ function tryDef(lines, i, starts, text, ctx) {
   return { nextI };
 }
 
-// --- HTML blocks -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// HTML blocks
+// ---------------------------------------------------------------------------
 
 const _htmlCommentSrc = '<!--(?:-?>|[\\s\\S]*?(?:-->|$))';
 const _htmlAttrSrc = ' +[a-zA-Z:_][\\w.:-]*(?: *= *"[^"\\n]*"| *= *\'[^\'\\n]*\'| *= *[^\\s"\'=<>`]+)?';
@@ -1357,9 +1382,11 @@ function tryHtmlBlock(lines, i, starts, text) {
   return { text: raw, nextI };
 }
 
-// --- tables ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
 
-function parseTable(lines, i, end, ctx) {
+function parseTable(lines, i, end, doc) {
   const headLine = lines[i].trim();
   const delimLine = lines[i + 1];
   const headers = splitCells(headLine);
@@ -1389,9 +1416,11 @@ function parseTable(lines, i, end, ctx) {
   return { block: { k: 'table', head, rows }, nextI: j };
 }
 
-// --- paragraph / text (with setext headings) ---------------------------------
+// ---------------------------------------------------------------------------
+// Paragraph / text (with setext headings)
+// ---------------------------------------------------------------------------
 
-function parseParagraph(lines, i, end, ctx, top) {
+function parseParagraph(lines, i, end, doc, top) {
   const textLines = [];
   let j = i;
   let inCode = false; // top=false only: last appended line was indented code
@@ -1447,9 +1476,11 @@ function parseParagraph(lines, i, end, ctx, top) {
   return { block: { k: top ? 'p' : 'text', text }, nextI: j };
 }
 
-// --- the block dispatcher -----------------------------------------------------
+// ---------------------------------------------------------------------------
+// The block dispatcher
+// ---------------------------------------------------------------------------
 
-function parseBlocks(text, ctx, top) {
+function parseBlocks(text, doc, top) {
   const lines = text.split('\n');
   // A trailing '\n' produces a phantom empty line; it is not a real line.
   let end = lines.length;
@@ -1528,7 +1559,7 @@ function parseBlocks(text, ctx, top) {
     if (isHrLine(line)) { blocks.push({ k: 'hr' }); i++; continue; }
     // blockquote
     if (/^ {0,3}>/.test(line)) {
-      const r = parseBlockquote(lines, i, end, ctx);
+      const r = parseBlockquote(lines, i, end, doc);
       blocks.push(r.block);
       i = r.nextI;
       continue;
@@ -1536,24 +1567,24 @@ function parseBlocks(text, ctx, top) {
     // list
     const bull = isBulletLine(line);
     if (bull) {
-      const r = parseList(lines, i, end, ctx);
+      const r = parseList(lines, i, end, doc);
       if (r) { blocks.push(r.block); i = r.nextI; continue; }
     }
     // html block
     const html = tryHtmlBlock(lines, i, starts, text);
     if (html) { blocks.push({ k: 'html', text: html.text }); i = html.nextI; continue; }
     // link reference definition
-    const def = tryDef(lines, i, starts, text, ctx);
+    const def = tryDef(lines, i, starts, text, doc);
     if (def) { i = def.nextI; continue; }
     // table
     if (isTableStart(lines, i, 3)) {
-      const r = parseTable(lines, i, end, ctx);
+      const r = parseTable(lines, i, end, doc);
       blocks.push(r.block);
       i = r.nextI;
       continue;
     }
     // paragraph / text (setext headings are handled inside)
-    const r = parseParagraph(lines, i, end, ctx, top);
+    const r = parseParagraph(lines, i, end, doc, top);
     blocks.push(r.block);
     i = r.nextI;
   }
@@ -1561,7 +1592,9 @@ function parseBlocks(text, ctx, top) {
   return blocks;
 }
 
-// --- blockquotes -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Blockquotes
+// ---------------------------------------------------------------------------
 
 const BLOCKQUOTE_STRIP_RE = /^ {0,3}>[ \t]?/gm;
 const BLOCKQUOTE_MARKER_WS_RE = /^( {0,3}>)([ \t]+)/gm;
@@ -1581,7 +1614,7 @@ function isBqParaInterrupt(line, lines, j) {
   return false;
 }
 
-function parseBlockquote(lines, i, end, ctx) {
+function parseBlockquote(lines, i, end, doc) {
   // Collect the raw lines: '>' lines plus lazy paragraph continuations.
   const rawLines = [];
   let inPara = false;
@@ -1618,7 +1651,7 @@ function parseBlockquote(lines, i, end, ctx) {
       .replace(BLOCKQUOTE_MARKER_WS_RE, (_, marker, ws) => marker + expandTabs(ws, marker.length))
       .replace(BLOCKQUOTE_SETEXT_RE, '\n    $1')
       .replace(BLOCKQUOTE_STRIP_RE, '');
-    const chunkBlocks = parseBlocks(currentText, ctx, true);
+    const chunkBlocks = parseBlocks(currentText, doc, true);
     if (blocks.length > 0 && blocks[blocks.length - 1].k === 'p'
       && chunkBlocks.length > 0 && chunkBlocks[0].k === 'p') {
       blocks[blocks.length - 1].text += '\n' + chunkBlocks[0].text;
@@ -1640,7 +1673,7 @@ function parseBlockquote(lines, i, end, ctx) {
       // Include the continuation in the nested blockquote.
       const continuation = restLines.join('\n');
       const newText = last.raw + '\n' + continuation.replace(BLOCKQUOTE_STRIP_RE, '');
-      const newQuote = parseBlockquoteText(newText, ctx);
+      const newQuote = parseBlockquoteText(newText, doc);
       blocks[blocks.length - 1] = newQuote.block;
       const leftover = newText.substring(newQuote.raw.length).replace(/^\n/, '');
       const leftoverCount = leftover ? leftover.split('\n').length : 0;
@@ -1656,7 +1689,7 @@ function parseBlockquote(lines, i, end, ctx) {
     if (last && last.k === 'list') {
       // Include the continuation in the nested list.
       const newText = last.raw + '\n' + restLines.join('\n');
-      const newList = parseListText(newText, ctx);
+      const newList = parseListText(newText, doc);
       blocks[blocks.length - 1] = newList.block;
       const consumedCount = newList.block.raw.length > last.raw.length
         ? newText.slice(last.raw.length + 1, newList.block.raw.length).split('\n').length
@@ -1671,13 +1704,15 @@ function parseBlockquote(lines, i, end, ctx) {
   return { block: { k: 'quote', b: blocks, raw }, nextI: i + consumed };
 }
 
-function parseBlockquoteText(text, ctx) {
+function parseBlockquoteText(text, doc) {
   const lines = text.split('\n');
-  const r = parseBlockquote(lines, 0, lines.length, ctx);
+  const r = parseBlockquote(lines, 0, lines.length, doc);
   return { block: r.block, raw: r.block.raw };
 }
 
-// --- lists -------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Lists
+// ---------------------------------------------------------------------------
 
 const _itemLineCache = new Map();
 function matchItemLine(line, bullPattern) {
@@ -1700,7 +1735,7 @@ function isLheadingPair(prevLine, nextLine) {
   return isValidLheadingText([prevLine]);
 }
 
-function parseList(lines, i, end, ctx) {
+function parseList(lines, i, end, doc) {
   const firstBull = isBulletLine(lines[i]);
   if (!firstBull) return null;
   const isOrdered = firstBull.ordered;
@@ -1795,7 +1830,7 @@ function parseList(lines, i, end, ctx) {
   const raw = lines.slice(i, j).join('\n').trimEnd();
   // First pass: parse each item's blocks and finalize looseness.
   for (const item of items) {
-    item.b = parseBlocks(item.text, ctx, false);
+    item.b = parseBlocks(item.text, doc, false);
     if (!loose && item.b.loose) loose = true;
   }
   // Second pass: task checkboxes.
@@ -1827,9 +1862,9 @@ function parseList(lines, i, end, ctx) {
   };
 }
 
-function parseListText(text, ctx) {
+function parseListText(text, doc) {
   const lines = text.split('\n');
-  const r = parseList(lines, 0, lines.length, ctx);
+  const r = parseList(lines, 0, lines.length, doc);
   if (!r) return { block: { k: 'list', o: false, s: 0, loose: false, items: [], raw: '' } };
   return r;
 }
@@ -1842,17 +1877,17 @@ function newInlineState() {
   return { inLink: false, inRawBlock: false, linkEmitted: false, hasParen: false };
 }
 
-function renderBlocks(blocks, ctx, out) {
+function renderBlocks(blocks, doc, out) {
   for (const b of blocks) {
     switch (b.k) {
       case 'p':
-        out.push('<p>' + inlineHtml(b.text, ctx.refs, ctx.ist) + '</p>\n');
+        out.push('<p>' + inlineHtml(b.text, doc.refs, doc.ist) + '</p>\n');
         break;
       case 'text':
-        out.push(inlineHtml(b.text, ctx.refs, ctx.ist));
+        out.push(inlineHtml(b.text, doc.refs, doc.ist));
         break;
       case 'h':
-        out.push('<h' + b.d + '>' + inlineHtml(b.text, ctx.refs, ctx.ist) + '</h' + b.d + '>\n');
+        out.push('<h' + b.d + '>' + inlineHtml(b.text, doc.refs, doc.ist) + '</h' + b.d + '>\n');
         break;
       case 'code': {
         const langString = (b.lang || '').match(/^\S*/) ? (b.lang || '').match(/^\S*/)[0] : '';
@@ -1870,7 +1905,7 @@ function renderBlocks(blocks, ctx, out) {
         break;
       case 'quote': {
         const inner = [];
-        renderBlocks(b.b, ctx, inner);
+        renderBlocks(b.b, doc, inner);
         out.push('<blockquote>\n' + inner.join('') + '</blockquote>\n');
         break;
       }
@@ -1883,7 +1918,7 @@ function renderBlocks(blocks, ctx, out) {
             ? '<input ' + (item.checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> '
             : '';
           const inner = [];
-          renderBlocks(item.b, ctx, inner);
+          renderBlocks(item.b, doc, inner);
           let html = inner.join('');
           if (item.task && b.loose) {
             // The checkbox goes inside the first paragraph.
@@ -1900,7 +1935,7 @@ function renderBlocks(blocks, ctx, out) {
           for (const c of row) {
             const tag = isHead ? 'th' : 'td';
             s += '<' + tag + (c.a ? ' align="' + c.a + '"' : '') + '>'
-              + inlineHtml(c.t, ctx.refs, ctx.ist)
+              + inlineHtml(c.t, doc.refs, doc.ist)
               + '</' + tag + '>\n';
           }
           return s;
@@ -1928,12 +1963,12 @@ function renderBlocks(blocks, ctx, out) {
 // replicating for the rare generated documents that contain it.
 const BAIL_EMAIL_UNDERSCORE = /_[A-Za-z0-9._+\-]*@/;
 
-function fastParse(md) {
+function renderFast(md) {
   if (BAIL_EMAIL_UNDERSCORE.test(md)) throw new Error('bail: underscore email');
   const src = md.replace(/\r\n?/g, '\n');
-  const ctx = { refs: new Map(), ist: newInlineState() };
-  const blocks = parseBlocks(src, ctx, true);
+  const doc = { refs: new Map(), ist: newInlineState() };
+  const blocks = parseBlocks(src, doc, true);
   const out = [];
-  renderBlocks(blocks, ctx, out);
+  renderBlocks(blocks, doc, out);
   return out.join('');
 }

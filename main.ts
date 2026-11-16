@@ -14,6 +14,10 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as { id: string; markdown: string }[];
+
+// Render each case in order into a pre-sized array, then write the whole
+// result as one JSON document. The output directory may not exist yet in
+// the harness sandbox, so create it first.
 const html: string[] = new Array(cases.length);
 for (let i = 0; i < cases.length; i++) html[i] = parse(cases[i].markdown);
 mkdirSync(OUTPUT_DIR, { recursive: true });

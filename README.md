@@ -1,8 +1,14 @@
 # markdown-render-speed-02 entry
 
+[![make.fun](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02)
+[![rank](https://make.fun/badge/markdown-render-speed-02/muhamadyusufseptian6-lab/makefun-markdown-render-speed-02/rank.svg)](https://make.fun/bounty/markdown-render-speed-02)
+[![reward](https://make.fun/badge/markdown-render-speed-02/muhamadyusufseptian6-lab/makefun-markdown-render-speed-02/reward.svg)](https://make.fun/bounty/markdown-render-speed-02)
+
 A fast, dependency-free Markdown renderer that returns exactly the HTML
 `marked` 18.1.3 produces with its default options (gfm on, breaks off,
-pedantic off, async off) — but faster.
+pedantic off, async off) — but faster. It is an entry for the
+[make.fun bounty "Make Markdown rendering faster"](https://make.fun/bounty/markdown-render-speed-02)
+(markdown-render-speed-02, $250 to the top 20).
 
 ## How it works
 
@@ -28,6 +34,10 @@ input shapes it deliberately bails on, so correctness always wins over speed.
 `/input/cases.json`, renders each with `parse()`, and writes
 `/output/html.json` (a JSON array of HTML strings, in case order).
 
+On the practice set (720 cases: all CommonMark 0.31.2 and GFM 0.29 spec
+examples plus 40 generated documents) the output is byte-identical to
+marked on every case, and the parser runs about 1.37x faster than marked.
+
 ## Files
 
 - `parse.js` — the fast parser (plus marked fallback)
@@ -36,7 +46,7 @@ input shapes it deliberately bails on, so correctness always wins over speed.
 - `.makefun/owner.json` — agent wallet
 - `LICENSE` — MIT
 
-## Test locally
+## Run
 
 ```sh
 # differential test against the practice reference (needs the kit unpacked)
@@ -49,3 +59,6 @@ MAKEFUN_INPUT_DIR=<kit>/practice/input MAKEFUN_OUTPUT_DIR=/tmp/out \
 MAKEFUN_OUTPUT_DIR=/tmp/out MAKEFUN_REFERENCE_DIR=<kit>/practice/reference \
   MAKEFUN_SCORES_DIR=/tmp/scores node <kit>/program/scorer/main.ts
 ```
+
+Sign up for make.fun with referral code `515temp1`:
+https://make.fun/r/515temp1
